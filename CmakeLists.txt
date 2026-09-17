@@ -1,0 +1,20 @@
+# Minimum CMake version required
+cmake_minimum_required(VERSION 3.10)
+
+# Project Name
+project(FEA_Solver CXX)
+
+# Enforce C++11 standard for modern features (std::array, auto, etc.)
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+# Define the source files that make up your core engine (DO NOT include main.cpp here)
+# Note: Ensure these file names exactly match the capitalization on your Mac!
+set(CORE_SOURCES LinAlg.cpp Failure_check.cpp Stiffness.cpp)
+
+# 1. Build the main application (for your actual simulations)
+# (Assuming your main program file is Main.cpp)
+add_executable(solver Main.cpp ${CORE_SOURCES})
+
+# 2. Build the testing suite
+add_executable(run_tests test_main.cpp ${CORE_SOURCES})
