@@ -1,121 +1,177 @@
 #include "LinAlg.h"
-#include <cmath>
+#include "Data_structs.h"
+#include <vector>
 #include <algorithm>
+#include <chrono>
+#include <stdexcept>
 #include <iostream>
+#include <cmath>
 
-SpMatBuilder::SpMatBuilder(int size) {
-    n = size;
-}
+// 1. SpMatBuilder Constructor
+SpMatBuilder::SpMatBuilder(int n) : num_rows(n) {}
 
+// 2. Add values into the triplet list
 void SpMatBuilder::addVal(int r, int c, double val) {
-    if (std::abs(val) > 1e-15) {
-        vals_arr.push_back({r, c, val});
-    }
+    triplets.push_back({r, c, val});
 }
 
+// 3. Finalize: Sort triplets, sum duplicates, and assemble into CSR format
 CSR SpMatBuilder::finalize() {
-    CSR m;
-    m.num_rows = n;
-    m.rowPtr.assign(n + 1, 0);
+    CSR mat;
+    mat.num_rows = num_rows;
+    mat.rowPtr.assign(num_rows + 1, 0);
 
-    if(vals_arr.empty()) return m;
+    if (triplets.empty()) {
+        return mat;
+    }
 
-    std::sort(vals_arr.begin(), vals_arr.end());
+    // Sort by row, then by column
+    std::sort(triplets.begin(), triplets.end());
 
-    int current_row = -1;
-    int last_c = -1;
-    double current_sum = 0;
+    // Merge duplicate contributions at shared nodes
+    std::vector<Triplet> merged;
+    merged.reserve(triplets.size());
 
-    for(size_t i = 0; i < vals_arr.size(); i++) {
-        if(vals_arr[i].r != current_row || vals_arr[i].c != last_c) {
-            if(current_row != -1) {
-                m.cols.push_back(last_c);
-                m.vals.push_back(current_sum);
-            }
-            
-            while(current_row < vals_arr[i].r) {
-                current_row++;
-                m.rowPtr[current_row] = m.vals.size();
-            }
-            last_c = vals_arr[i].c;
-            current_sum = vals_arr[i].val;
+    for (const auto& t : triplets) {
+        if (!merged.empty() && merged.back().r == t.r && merged.back().c == t.c) {
+            merged.back().val += t.val;
         } else {
-            current_sum += vals_arr[i].val; 
+            merged.push_back(t);
         }
     }
-    
-    m.cols.push_back(last_c);
-    m.vals.push_back(current_sum);
-    
-    while(current_row < n) {
-        current_row++;
-        m.rowPtr[current_row] = m.vals.size();
+
+    // Populate CSR flat arrays, ignoring entries below 1e-15
+    mat.vals.reserve(merged.size());
+    mat.cols.reserve(merged.size());
+
+    for (const auto& t : merged) {
+        if (std::abs(t.val) < 1e-15) {
+            continue; // Drop structural/numerical zeros
+        }
+        mat.vals.push_back(t.val);
+        mat.cols.push_back(t.c);
+        mat.rowPtr[t.r + 1]++;
     }
-    
-    return m;
+
+    // Prefix sum to compute row offsets
+    for (int i = 0; i < num_rows; ++i) {
+        mat.rowPtr[i + 1] += mat.rowPtr[i];
+    }
+
+    return mat;
 }
 
-void solve_pcg(const CSR& A, const std::vector<double>& b, std::vector<double>& x, double tol) {
-    int n = b.size();
-    x.assign(n, 0.0);
+// 4. Sparse Matrix-Vector Multiplication with dimension validation
+void CSR::spmv(const std::vector<double>& x, std::vector<double>& y) const {
+    if (x.size() != static_cast<size_t>(num_rows) || y.size() != static_cast<size_t>(num_rows)) {
+        throw std::invalid_argument("Vector dimensions do not match CSR matrix.");
+    }
+    for (int i = 0; i < num_rows; ++i) {
+        double sum = 0.0;
+        for (int j = rowPtr[i]; j < rowPtr[i + 1]; ++j) {
+            sum += vals[j] * x[cols[j]];
+        }
+        y[i] = sum;
+    }
+}
 
-    std::vector<double> M(n, 1.0); 
-    for (int i = 0; i < n; i++) {
-       for (int j = A.rowPtr[i]; j < A.rowPtr[i + 1]; j++) {
-           if (A.cols[j] == i) {
-               if (std::abs(A.vals[j]) > 1e-14) M[i] = 1.0 / A.vals[j];
-               break;
-           }
-       }
+// 5. Preconditioned Conjugate Gradient Solver with profiling and safety checks
+void solve_pcg(const CSR& K, const std::vector<double>& f, std::vector<double>& u, double tol) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    int N = K.num_rows;
+    if (f.size() != static_cast<size_t>(N)) {
+        throw std::invalid_argument("Force vector f dimension does not match matrix rows.");
     }
 
-    std::vector<double> r = b;
-    std::vector<double> z(n);
-    for (int i = 0; i < n; i++) z[i] = M[i] * r[i];
+    // If u was passed in empty or wrong size, allocate and initialize with 0.0
+    if (u.size() != static_cast<size_t>(N)) {
+        u.assign(N, 0.0);
+    }
 
-    std::vector<double> p = z;
-    std::vector<double> Ap(n, 0.0);
+    // Allocate memory outside the loop (no heap reallocations during solve)
+    std::vector<double> r = f; 
+    std::vector<double> z(N, 0.0);
+    std::vector<double> p(N, 0.0);
+    std::vector<double> Ap(N, 0.0);
+    std::vector<double> M_inv(N, 1.0);
 
-    auto dot = [](const std::vector<double>& u, const std::vector<double>& v) {
-        double s = 0.0;
-        for (size_t i = 0; i < u.size(); i++) s += u[i] * v[i];
-        return s;
-    };
+    // Extract diagonal for Jacobi preconditioner and verify positive-definiteness
+    for (int i = 0; i < N; ++i) {
+        for (int j = K.rowPtr[i]; j < K.rowPtr[i+1]; ++j) {
+            if (K.cols[j] == i) {
+                if (K.vals[j] <= 0.0) {
+                    throw std::runtime_error("Matrix diagonal is zero/negative. Not Positive-Definite.");
+                }
+                M_inv[i] = 1.0 / K.vals[j];
+                break;
+            }
+        }
+    }
 
-    double rz_old = dot(r, z);
-    double norm_b = std::sqrt(dot(b, b));
-    if (norm_b < 1e-14) norm_b = 1.0;
+    // Initial residual adjustment
+    K.spmv(u, Ap);
+    double rz_old = 0.0;
+    for (int i = 0; i < N; ++i) {
+        r[i] -= Ap[i];
+        z[i] = M_inv[i] * r[i];
+        p[i] = z[i];
+        rz_old += r[i] * z[i];
+    }
 
-    int max_iters = 5000;
-    for (int iter = 0; iter < max_iters; iter++) {
-        A.spmv(p, Ap);
-        double pAp = dot(p, Ap);
+    int max_iters = N * 2; 
+    int iter = 0;
+    double max_res = 1.0;
+
+    // Iterative loop
+    while (iter < max_iters) {
+        K.spmv(p, Ap);
+        
+        double pAp = 0.0;
+        for (int i = 0; i < N; ++i) {
+            pAp += p[i] * Ap[i];
+        }
 
         if (pAp <= 0.0) {
-            std::cout << "matrix indefinite error in pcg" << std::endl;
-            return;
+            throw std::runtime_error("Matrix indefinite. PCG divergence detected.");
         }
 
         double alpha = rz_old / pAp;
-        for (int i = 0; i < n; i++) {
-            x[i] += alpha * p[i];
+        double rz_new = 0.0;
+        max_res = 0.0;
+
+        for (int i = 0; i < N; ++i) {
+            u[i] += alpha * p[i];
             r[i] -= alpha * Ap[i];
+            z[i] = M_inv[i] * r[i];
+            rz_new += r[i] * z[i];
+            if (std::abs(r[i]) > max_res) {
+                max_res = std::abs(r[i]);
+            }
         }
 
-        double res_norm = std::sqrt(dot(r, r)) / norm_b;
-        if (res_norm < tol) {
-            return;
+        if (max_res < tol) {
+            break;
         }
 
-        for (int i = 0; i < n; i++) z[i] = M[i] * r[i];
-        
-        double rz_new = dot(r, z);
         double beta = rz_new / rz_old;
-
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < N; ++i) {
             p[i] = z[i] + beta * p[i];
         }
         
         rz_old = rz_new;
+        iter++;
     }
+
+    if (iter >= max_iters) {
+        throw std::runtime_error("PCG failed to converge within maximum iterations.");
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
+    
+    std::cout << "[PROFILING] PCG Solver Converged in " << iter << " iterations.\n";
+    std::cout << "[PROFILING] PCG Execution Time: " << elapsed.count() << " ms.\n";
+    std::cout << "[PROFILING] Final Max Residual: " << max_res << "\n";
+    std::cout << "[PROFILING] Sparse Matrix Memory Footprint: " << K.get_memory_footprint_mb() << " MB.\n";
 }
