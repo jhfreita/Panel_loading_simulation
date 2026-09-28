@@ -2,176 +2,210 @@
 #include "Data_structs.h"
 #include <vector>
 #include <algorithm>
-#include <chrono>
-#include <stdexcept>
 #include <iostream>
 #include <cmath>
+#include <stdexcept>
 
-// 1. SpMatBuilder Constructor
-SpMatBuilder::SpMatBuilder(int n) : num_rows(n) {}
+bool compareTriplets(const Triplet& a, const Triplet& b) {
+    if (a.r < b.r) {
+        return true;
+    }
+    else if (a.r > b.r) {
+        return false;
+    }
 
-// 2. Add values into the triplet list
-void SpMatBuilder::addVal(int r, int c, double val) {
-    triplets.push_back({r, c, val});
+    else if (a.c < b.c) {
+        return true;
+    }
+    else if (a.c > b.c) {
+        return false;
+    }
+    else {return false;}
 }
 
-// 3. Finalize: Sort triplets, sum duplicates, and assemble into CSR format
+SpMatBuilder::SpMatBuilder(int n) {
+    num_rows = n;
+}
+
+void SpMatBuilder::addVal(int r, int c, double val) {
+    Triplet temp_triplet;
+    temp_triplet.r = r;
+    temp_triplet.c = c;
+    temp_triplet.val = val;
+
+    triplets.push_back(temp_triplet);
+}
+
 CSR SpMatBuilder::finalize() {
     CSR mat;
     mat.num_rows = num_rows;
-    mat.rowPtr.assign(num_rows + 1, 0);
 
-    if (triplets.empty()) {
+    for (int i = 0; i <= num_rows; i = i + 1) {
+        mat.rowPtr.push_back(0);
+    }
+
+    if (triplets.size() == 0) {
         return mat;
     }
 
-    // Sort by row, then by column
-    std::sort(triplets.begin(), triplets.end());
+    // Sort using the custom compareTriplets function we defined above
+    std::sort(triplets.begin(), triplets.end(), compareTriplets);
 
-    // Merge duplicate contributions at shared nodes
     std::vector<Triplet> merged;
-    merged.reserve(triplets.size());
+    int i = 0;
+    
+    while (i < (int)triplets.size()) {
+        int target_row = triplets[i].r;
+        int target_col = triplets[i].c;
+        double sum_of_values = 0.0;
 
-    for (const auto& t : triplets) {
-        if (!merged.empty() && merged.back().r == t.r && merged.back().c == t.c) {
-            merged.back().val += t.val;
-        } else {
-            merged.push_back(t);
+        while (i < (int)triplets.size() && triplets[i].r == target_row && triplets[i].c == target_col) {
+            sum_of_values = sum_of_values + triplets[i].val;
+            i = i + 1; 
+        }
+
+        if (std::abs(sum_of_values) > 0.0000001) {
+            Triplet combined_triplet;
+            combined_triplet.r = target_row;
+            combined_triplet.c = target_col;
+            combined_triplet.val = sum_of_values;
+            merged.push_back(combined_triplet);
         }
     }
 
-    // Populate CSR flat arrays, ignoring entries below 1e-15
-    mat.vals.reserve(merged.size());
-    mat.cols.reserve(merged.size());
+    for (int k = 0; k < (int)merged.size(); k++) {
+        mat.vals.push_back((merged[k]).val);
+        mat.cols.push_back((merged[k]).c);
 
-    for (const auto& t : merged) {
-        if (std::abs(t.val) < 1e-15) {
-            continue; // Drop structural/numerical zeros
-        }
-        mat.vals.push_back(t.val);
-        mat.cols.push_back(t.c);
-        mat.rowPtr[t.r + 1]++;
+        int row_index = (merged[k]).r;
+        mat.rowPtr[row_index + 1] = mat.rowPtr[row_index + 1] + 1;
     }
 
-    // Prefix sum to compute row offsets
-    for (int i = 0; i < num_rows; ++i) {
-        mat.rowPtr[i + 1] += mat.rowPtr[i];
+    // Prefix sum to convert counts into offsets
+    for (int k = 0; k < num_rows; k++) {
+        mat.rowPtr[k + 1] = mat.rowPtr[k + 1] + mat.rowPtr[k];
     }
 
     return mat;
 }
 
-// 4. Sparse Matrix-Vector Multiplication with dimension validation
 void CSR::spmv(const std::vector<double>& x, std::vector<double>& y) const {
-    if (x.size() != static_cast<size_t>(num_rows) || y.size() != static_cast<size_t>(num_rows)) {
-        throw std::invalid_argument("Vector dimensions do not match CSR matrix.");
-    }
-    for (int i = 0; i < num_rows; ++i) {
-        double sum = 0.0;
-        for (int j = rowPtr[i]; j < rowPtr[i + 1]; ++j) {
-            sum += vals[j] * x[cols[j]];
+    for (int i = 0; i < num_rows; i = i + 1) {
+        double row_sum = 0.0;
+
+        int start_index = rowPtr[i];
+        int end_index = rowPtr[i + 1];
+
+        for (int j = start_index; j < end_index; j = j + 1) {
+            int target_column = cols[j];
+            double value = vals[j];
+
+            row_sum = row_sum + (value * x[target_column]);
         }
-        y[i] = sum;
+
+        y[i] = row_sum;
     }
 }
 
-// 5. Preconditioned Conjugate Gradient Solver with profiling and safety checks
 void solve_pcg(const CSR& K, const std::vector<double>& f, std::vector<double>& u, double tol) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
     int N = K.num_rows;
-    if (f.size() != static_cast<size_t>(N)) {
-        throw std::invalid_argument("Force vector f dimension does not match matrix rows.");
+
+    if (u.size() != (size_t)N) {
+        u.clear();
+        for (int i = 0; i < N; i = i + 1) {
+            u.push_back(0.0);
+        }
     }
 
-    // If u was passed in empty or wrong size, allocate and initialize with 0.0
-    if (u.size() != static_cast<size_t>(N)) {
-        u.assign(N, 0.0);
+    std::vector<double> r;      
+    std::vector<double> z;      
+    std::vector<double> p;      
+    std::vector<double> Ap;     
+    std::vector<double> M_inv;  
+
+    for (int i = 0; i < N; i = i + 1) {
+        r.push_back(f[i]);
+        z.push_back(0.0);
+        p.push_back(0.0);
+        Ap.push_back(0.0);
+        M_inv.push_back(1.0);
     }
 
-    // Allocate memory outside the loop (no heap reallocations during solve)
-    std::vector<double> r = f; 
-    std::vector<double> z(N, 0.0);
-    std::vector<double> p(N, 0.0);
-    std::vector<double> Ap(N, 0.0);
-    std::vector<double> M_inv(N, 1.0);
+    for (int i = 0; i < N; i = i + 1) {
+        int start_index = K.rowPtr[i];
+        int end_index = K.rowPtr[i + 1];
 
-    // Extract diagonal for Jacobi preconditioner and verify positive-definiteness
-    for (int i = 0; i < N; ++i) {
-        for (int j = K.rowPtr[i]; j < K.rowPtr[i+1]; ++j) {
+        for (int j = start_index; j < end_index; j = j + 1) {
             if (K.cols[j] == i) {
-                if (K.vals[j] <= 0.0) {
-                    throw std::runtime_error("Matrix diagonal is zero/negative. Not Positive-Definite.");
+                double diagonal_val = K.vals[j];
+
+                if (diagonal_val <= 0.0) {
+                    throw std::runtime_error("Matrix diagonal is not positive.");
                 }
-                M_inv[i] = 1.0 / K.vals[j];
-                break;
+
+                M_inv[i] = 1.0 / diagonal_val;
+                break; 
             }
         }
     }
 
-    // Initial residual adjustment
     K.spmv(u, Ap);
+
     double rz_old = 0.0;
-    for (int i = 0; i < N; ++i) {
-        r[i] -= Ap[i];
+    for (int i = 0; i < N; i++) {
+        r[i] = r[i] - Ap[i];
         z[i] = M_inv[i] * r[i];
         p[i] = z[i];
-        rz_old += r[i] * z[i];
+        rz_old = rz_old + (r[i] * z[i]);
     }
 
-    int max_iters = N * 2; 
-    int iter = 0;
-    double max_res = 1.0;
+    int max_iterations = N * 2;
+    int current_iter = 0;
+    double largest_error = 1.0;
 
-    // Iterative loop
-    while (iter < max_iters) {
+    while (current_iter < max_iterations) {
         K.spmv(p, Ap);
-        
+
         double pAp = 0.0;
-        for (int i = 0; i < N; ++i) {
-            pAp += p[i] * Ap[i];
+        for (int i = 0; i < N; i = i + 1) {
+            pAp = pAp + (p[i] * Ap[i]);
         }
 
         if (pAp <= 0.0) {
-            throw std::runtime_error("Matrix indefinite. PCG divergence detected.");
+            throw std::runtime_error("Matrix is indefinite. PCG cannot continue.");
         }
 
         double alpha = rz_old / pAp;
         double rz_new = 0.0;
-        max_res = 0.0;
+        largest_error = 0.0;
 
-        for (int i = 0; i < N; ++i) {
-            u[i] += alpha * p[i];
-            r[i] -= alpha * Ap[i];
+        for (int i = 0; i < N; i = i + 1) {
+            u[i] = u[i] + (alpha * p[i]);
+            r[i] = r[i] - (alpha * Ap[i]);
             z[i] = M_inv[i] * r[i];
-            rz_new += r[i] * z[i];
-            if (std::abs(r[i]) > max_res) {
-                max_res = std::abs(r[i]);
+
+            rz_new = rz_new + (r[i] * z[i]);
+
+            double absolute_r = std::abs(r[i]);
+            if (absolute_r > largest_error) {
+                largest_error = absolute_r;
             }
         }
 
-        if (max_res < tol) {
+        if (largest_error < tol) {
             break;
         }
 
         double beta = rz_new / rz_old;
-        for (int i = 0; i < N; ++i) {
-            p[i] = z[i] + beta * p[i];
+
+        for (int i = 0; i < N; i = i + 1) {
+            p[i] = z[i] + (beta * p[i]);
         }
-        
+
         rz_old = rz_new;
-        iter++;
+        current_iter = current_iter + 1;
     }
 
-    if (iter >= max_iters) {
-        throw std::runtime_error("PCG failed to converge within maximum iterations.");
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
-    
-    std::cout << "[PROFILING] PCG Solver Converged in " << iter << " iterations.\n";
-    std::cout << "[PROFILING] PCG Execution Time: " << elapsed.count() << " ms.\n";
-    std::cout << "[PROFILING] Final Max Residual: " << max_res << "\n";
-    std::cout << "[PROFILING] Sparse Matrix Memory Footprint: " << K.get_memory_footprint_mb() << " MB.\n";
+    std::cout << "Solver completed in " << current_iter << " iterations." << std::endl;
+    std::cout << "Final max residual error: " << largest_error << std::endl;
 }
