@@ -1,97 +1,140 @@
 #pragma once
+
 #include <vector>
 #include <array>
-#include <stdexcept>
+#include <cstddef>
 
-// Assumptions: Symmetric cross section; perfectly orthotropic 
-// Neglect P-delta effects; Fourier loading based on Timoshenko
 struct Material {
     double EIeffx;
     double EIeffy;
     double Gx;
     double Gy;
     double Gxy;
-    
-    double nu;
+    double thickness;
     double t;
-    double kappa; 
-    
-    double Mx_cap; 
+    double Mx_cap;
     double My_cap;
-    
-    // Rigorous Constructor: Validates thermodynamic and physical reality
-    Material(double EIx, double EIy, double Gx_, double Gy_, double Gxy_, double t_) {
-        if (t_ <= 0.0) {
-            throw std::invalid_argument("Material thickness must be strictly positive.");
-        }
-        if (EIx <= 0.0 || EIy <= 0.0) {
-            throw std::invalid_argument("Flexural rigidities must be strictly positive.");
-        }
-        if (Gx_ <= 0.0 || Gy_ <= 0.0 || Gxy_ <= 0.0) {
-            throw std::invalid_argument("Shear moduli must be strictly positive.");
-        }
-        
-        EIeffx = EIx;
-        EIeffy = EIy;
-        Gx = Gx_;
-        Gy = Gy_;
-        Gxy = Gxy_;
-        t = t_;
-        
-        nu = 0.02; 
+    double nu;     // Poisson's ratio
+    double kappa;  // Mindlin shear factor
+
+    Material() {
+        EIeffx = 0.0;
+        EIeffy = 0.0;
+        Gx = 0.0;
+        Gy = 0.0;
+        Gxy = 0.0;
+        thickness = 0.0;
+        t = 0.0;
+        Mx_cap = 0.0;
+        My_cap = 0.0;
+        nu = 0.2;
         kappa = 5.0 / 6.0;
-        Mx_cap = 10000.0; 
-        My_cap = 3000.0;
+    }
+
+    Material(double ex, double ey, double gx, double gy, double gxy, double thick) {
+        EIeffx = ex;
+        EIeffy = ey;
+        Gx = gx;
+        Gy = gy;
+        Gxy = gxy;
+        thickness = thick;
+        t = thick;
+        Mx_cap = 0.0;
+        My_cap = 0.0;
+        nu = 0.2;
+        kappa = 5.0 / 6.0;
     }
 };
+
 
 struct Node {
+    int id;
     double x;
     double y;
-    bool fix_w;
-    bool fix_tx;
-    bool fix_ty;
-    
-    Node() : x(0.0), y(0.0), fix_w(false), fix_tx(false), fix_ty(false) {}
-};
 
-struct Element {
-    std::array<int, 4> nodes;
-};
+    // Boundary condition flags (Degrees of Freedom)
+    bool fix_w;   // Out-of-plane displacement
+    bool fix_tx;  // Rotation about x
+    bool fix_ty;  // Rotation about y
 
-struct CSR {
-    int num_rows;
-    std::vector<double> vals;
-    std::vector<int> cols;
-    std::vector<int> rowPtr;
-
-    void spmv(const std::vector<double>& x, std::vector<double>& y) const;
-    
-    double get_memory_footprint_mb() const {
-        size_t bytes = 0;
-        bytes += vals.capacity() * sizeof(double);
-        bytes += cols.capacity() * sizeof(int);
-        bytes += rowPtr.capacity() * sizeof(int);
-        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    Node() {
+        id = 0;
+        x = 0.0;
+        y = 0.0;
+        fix_w = false;
+        fix_tx = false;
+        fix_ty = false;
     }
 };
+
+
+struct Element {
+    int id;
+    std::array<int, 4> nodes;
+
+    Element() {
+        id = 0;
+        nodes[0] = 0;
+        nodes[1] = 0;
+        nodes[2] = 0;
+        nodes[3] = 0;
+    }
+};
+
 
 struct Triplet {
     int r;
     int c;
     double val;
-    
-    bool operator<(const Triplet& other) const {
-        if (r == other.r) return c < other.c;
-        return r < other.r;
+
+    Triplet() {
+        r = 0;
+        c = 0;
+        val = 0.0;
+    }
+
+    Triplet(int row_index, int col_index, double value_in) {
+        r = row_index;
+        c = col_index;
+        val = value_in;
     }
 };
 
-// The missing builder required for LinAlg.cpp
+bool compareTriplets(const Triplet& a, const Triplet& b);
+
+struct CSR {
+    int num_rows;
+    std::vector<int> rowPtr;
+    std::vector<int> cols;
+    std::vector<double> vals;
+
+    CSR() {
+        num_rows = 0;
+    }
+
+    void spmv(const std::vector<double>& x, std::vector<double>& y) const;
+
+    double get_memory_footprint_mb() const {
+        double total_bytes = 0.0;
+
+        double row_ptr_bytes = (double)(rowPtr.size() * sizeof(int));
+        total_bytes = total_bytes + row_ptr_bytes;
+
+        double cols_bytes = (double)(cols.size() * sizeof(int));
+        total_bytes = total_bytes + cols_bytes;
+
+        double vals_bytes = (double)(vals.size() * sizeof(double));
+        total_bytes = total_bytes + vals_bytes;
+
+        double megabytes = total_bytes / (1024.0 * 1024.0);
+        return megabytes;
+    }
+};
+
 struct SpMatBuilder {
     int num_rows;
     std::vector<Triplet> triplets;
-    
+
     SpMatBuilder(int n);
     void addVal(int r, int c, double val);
     CSR finalize();
